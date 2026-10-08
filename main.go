@@ -1,115 +1,159 @@
 package main
 
 import (
-	"bufio"
 	"database/sql"
 	"fmt"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
-	_ "modernc.org/sqlite" // DRIVER GO PURO (Sem CGO)
+	_ "modernc.org/sqlite"
 )
 
 var cacheInternoRAM sync.Map
 var db *sql.DB
 
-func obtenerAdminUsuario() string {
-	usuario := os.Getenv("CMS_USER")
-	if usuario == "" {
-		return "admin"
+type LoginAttempt struct {
+	Count        int
+	BlockedUntil time.Time
+}
+var loginAttempts sync.Map
+
+func getEnv(key, fallback string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
 	}
-	return usuario
+	return fallback
 }
 
-func obtenerAdminSenha() string {
-	senha := os.Getenv("CMS_PASS")
-	if senha == "" {
-		return "admin"
+func getEnvStrict(key string) string {
+	if value, exists := os.LookupEnv(key); exists && value != "" {
+		return value
 	}
-	return senha
+	panic(fmt.Sprintf("ERRO CRÍTICO: A variável de ambiente %s é obrigatória!", key))
+}
+
+// limparHost remove https://, http://, www. e portas, garantindo que o slug seja sempre o domínio puro
+func limparHost(host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	host = strings.TrimPrefix(host, "https://")
+	host = strings.TrimPrefix(host, "http://")
+	host = strings.TrimPrefix(host, "www.")
+	if strings.Contains(host, ":") {
+		host = strings.Split(host, ":")[0]
+	}
+	return host
 }
 
 func main() {
-	// Carregador nativo de .env
-	if arquivo, err := os.Open(".env"); err == nil {
-		scanner := bufio.NewScanner(arquivo)
-		for scanner.Scan() {
-			linha := strings.TrimSpace(scanner.Text())
-			if linha == "" || strings.HasPrefix(linha, "#") {
-				continue
-			}
-			if partes := strings.SplitN(linha, "=", 2); len(partes) == 2 {
-				os.Setenv(strings.TrimSpace(partes[0]), strings.TrimSpace(partes[1]))
-			}
-		}
-		// Correção do warning: verificação de erro do scanner
-		if err := scanner.Err(); err != nil {
-			fmt.Printf("⚠️ Erro ao ler .env: %v\n", err)
-		}
-		arquivo.Close()
-		fmt.Println("🌱 Arquivo .env carregado localmente com sucesso!")
-	}
-
+	dbPath := getEnv("DB_PATH", "/data/paginas.db")
+	
 	var err error
-	db, err = sql.Open("sqlite", "./paginas.db")
+	db, err = sql.Open("sqlite", dbPath)
 	if err != nil {
-		panic(err)
+		panic(fmt.Errorf("falha ao abrir banco: %w", err))
 	}
 	defer db.Close()
 
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	_, _ = db.Exec("PRAGMA journal_mode=WAL;")
+	_, _ = db.Exec("PRAGMA synchronous=NORMAL;")
+	_, _ = db.Exec("PRAGMA cache_size=-64000;")
+	
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS landpages (slug TEXT PRIMARY KEY, html TEXT);`)
 	if err != nil {
-		panic(err)
+		panic(fmt.Errorf("falha ao criar tabela: %w", err))
 	}
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		subdominioAcessado := strings.ToLower(r.Host)
-		caminho := r.URL.Path
+	http.HandleFunc("/", handlePublicRequest)
+	http.HandleFunc("/admin-secreto", handleAdminRequest)
 
-		if caminho == "/admin-secreto" {
-			executarAdminSecreto(w, r)
-			return
-		}
-
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-
-		if htmlInstalado, encontrado := cacheInternoRAM.Load(subdominioAcessado); encontrado {
-			w.Write([]byte(htmlInstalado.(string)))
-			return
-		}
-
-		var htmlDaPagina string
-		err := db.QueryRow("SELECT html FROM landpages WHERE slug = ?", subdominioAcessado).Scan(&htmlDaPagina)
-
-		if err == sql.ErrNoRows {
-			w.WriteHeader(http.StatusNotFound)
-			fmt.Fprintf(w, "<h1>404 - Subdomínio não encontrado</h1><p>Para colocar este site no ar, vá ao painel e crie uma página com o nome exato: <strong>%s</strong></p>", subdominioAcessado)
-			return
-		} else if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintf(w, "<h1>500 - Erro interno</h1><p>%v</p>", err)
-			return
-		}
-
-		cacheInternoRAM.Store(subdominioAcessado, htmlDaPagina)
-		w.Write([]byte(htmlDaPagina))
-	})
-
-	fmt.Println("⚡ Servidor Micro-CMS rodando em http://localhost:80")
-	http.ListenAndServe(":8080", nil)
+	port := getEnv("PORT", "8080")
+	fmt.Printf("⚡ Servidor Micro-CMS rodando na porta %s (Produção)\n", port)
+	
+	server := &http.Server{
+		Addr:         ":" + port,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+	
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		panic(err)
+	}
 }
 
-func executarAdminSecreto(w http.ResponseWriter, r *http.Request) {
+func handlePublicRequest(w http.ResponseWriter, r *http.Request) {
+	// Limpa o host recebido do navegador (remove porta se houver)
+	subdominioAcessado := limparHost(r.Host)
+
+	if r.URL.Path == "/admin-secreto" {
+		handleAdminRequest(w, r)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+
+	if htmlInstalado, encontrado := cacheInternoRAM.Load(subdominioAcessado); encontrado {
+		w.Write([]byte(htmlInstalado.(string)))
+		return
+	}
+
+	var htmlDaPagina string
+	err := db.QueryRow("SELECT html FROM landpages WHERE slug = ?", subdominioAcessado).Scan(&htmlDaPagina)
+
+	if err == sql.ErrNoRows {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintf(w, "<h1>404 - Página não encontrada</h1><p>O domínio <strong>%s</strong> não possui uma landing page configurada.</p>", subdominioAcessado)
+		return
+	} else if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("Erro interno do servidor."))
+		return
+	}
+
+	cacheInternoRAM.Store(subdominioAcessado, htmlDaPagina)
+	w.Write([]byte(htmlDaPagina))
+}
+
+func handleAdminRequest(w http.ResponseWriter, r *http.Request) {
+	clientIP := strings.Split(r.RemoteAddr, ":")[0]
+	now := time.Now()
+
+	if attempt, ok := loginAttempts.Load(clientIP); ok {
+		data := attempt.(LoginAttempt)
+		if now.Before(data.BlockedUntil) {
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(fmt.Sprintf("Bloqueado por %v.", time.Until(data.BlockedUntil).Round(time.Second))))
+			return
+		}
+	}
+
 	usuario, senha, ok := r.BasicAuth()
-	if !ok || usuario != obtenerAdminUsuario() || senha != obtenerAdminSenha() {
-		w.Header().Set("WWW-Authenticate", `Basic realm="Dashboard Restrito"`)
+	adminUser := getEnvStrict("CMS_USER")
+	adminPass := getEnvStrict("CMS_PASS")
+
+	if !ok || usuario != adminUser || senha != adminPass {
+		attempt, _ := loginAttempts.LoadOrStore(clientIP, LoginAttempt{})
+		data := attempt.(LoginAttempt)
+		data.Count++
+		if data.Count >= 5 {
+			data.BlockedUntil = now.Add(15 * time.Minute)
+			data.Count = 0
+		}
+		loginAttempts.Store(clientIP, data)
+
+		w.Header().Set("WWW-Authenticate", `Basic realm="Dashboard"`)
 		w.WriteHeader(http.StatusUnauthorized)
 		w.Write([]byte("Acesso negado."))
 		return
 	}
+
+	loginAttempts.Delete(clientIP)
 
 	acao := r.URL.Query().Get("action")
 	slugEdicao := r.URL.Query().Get("edit")
@@ -125,9 +169,10 @@ func executarAdminSecreto(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodPost {
-		slug := strings.ToLower(strings.TrimSpace(r.FormValue("slug")))
+		// AQUI ESTÁ A MÁGICA: Limpa o host antes de salvar no banco!
+		slug := limparHost(r.FormValue("slug"))
 		htmlCodigo := r.FormValue("html_codigo")
-
+		
 		if slug != "" && htmlCodigo != "" {
 			_, _ = db.Exec("INSERT OR REPLACE INTO landpages (slug, html) VALUES (?, ?)", slug, htmlCodigo)
 			cacheInternoRAM.Store(slug, htmlCodigo)
@@ -149,142 +194,41 @@ func executarAdminSecreto(w http.ResponseWriter, r *http.Request) {
 			_ = linhas.Scan(&s)
 			listaSubdominios = append(listaSubdominios, s)
 		}
-		// Correção do warning: verificação de erro do sql.Rows
-		if err := linhas.Err(); err != nil {
-			fmt.Printf("⚠️ Erro ao ler banco de dados: %v\n", err)
-		}
 		linhas.Close()
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-
+	
 	isEditando := slugEdicao != ""
-	tituloForm := "✨ Criar Nova Landing Page"
-	if isEditando {
-		tituloForm = "📝 Editar Subdomínio"
-	}
+	tituloForm := "✨ Criar Nova Página"
+	if isEditando { tituloForm = "📝 Editar Página" }
 
 	readonlyAttr := `style="margin-top: 5px;"`
-	if isEditando {
-		readonlyAttr = `readonly style="opacity: 0.6; cursor: not-allowed; margin-top: 5px;"`
-	}
+	if isEditando { readonlyAttr = `readonly style="opacity: 0.6; cursor: not-allowed; margin-top: 5px;"` }
 
 	cancelBtn := ""
-	if isEditando {
-		cancelBtn = "<a href='/admin-secreto' class='cancel-btn'>Cancelar Edição</a>"
-	}
+	if isEditando { cancelBtn = "<a href='/admin-secreto' style='color:#fff; text-decoration:none; margin-top:10px; display:block;'>Cancelar</a>" }
 
-	// Renderização direta com fmt.Fprintf (padrão Go, eficiente e sem warnings de concatenação)
-	fmt.Fprintf(w, `<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-    <meta charset="UTF-8">
-    <title>Dashboard Micro-CMS</title>
-    <style>
-        :root { --bg: #09090b; --card: #141416; --primary: #00ff66; --border: #27272a; --text: #ffffff; --text-muted: #a1a1aa; }
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; padding: 40px; }
-        .header-container { max-width: 1200px; margin: 0 auto 30px auto; display: flex; justify-content: space-between; align-items: flex-start; }
-        .btn-logout { background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2); padding: 10px 20px; font-weight: 600; border-radius: 6px; cursor: pointer; transition: background 0.2s; font-size: 0.9rem; }
-        .btn-logout:hover { background: rgba(239, 68, 68, 0.2); }
-        .dashboard { max-width: 1200px; margin: 0 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 40px; }
-        @media (max-width: 900px) { .dashboard { grid-template-columns: 1fr; } }
-        .panel { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 30px; height: fit-content; }
-        h2 { font-size: 1.5rem; font-weight: 800; margin-bottom: 20px; display: flex; align-items: center; gap: 10px; }
-        form { display: flex; flex-direction: column; gap: 15px; }
-        label { font-size: 0.9rem; color: var(--text-muted); font-weight: 500; }
-        input, textarea { padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: #1c1c1e; color: #fff; font-size: 1rem; width: 100%%; font-family: monospace; }
-        input:focus, textarea:focus { border-color: var(--primary); outline: none; }
-        button[type="submit"] { background: var(--primary); color: #000; padding: 14px; font-weight: bold; font-size: 1rem; border: none; border-radius: 8px; cursor: pointer; transition: background 0.2s; text-transform: uppercase; letter-spacing: 0.5px; }
-        button[type="submit"]:hover { background: #00e65c; }
-        .cancel-btn { background: #27272a; color: #fff; text-decoration: none; padding: 10px; text-align: center; border-radius: 8px; font-size: 0.9rem; transition: background 0.2s; margin-top: 10px; display: block; }
-        .cancel-btn:hover { background: #3f3f46; }
-        table { width: 100%%; border-collapse: collapse; margin-top: 10px; }
-        th { text-align: left; padding: 12px; color: var(--text-muted); font-size: 0.85rem; text-transform: uppercase; border-bottom: 1px solid var(--border); }
-        td { padding: 16px 12px; border-bottom: 1px solid var(--border); font-size: 0.95rem; }
-        .actions { display: flex; gap: 10px; justify-content: flex-end; }
-        .btn-action { text-decoration: none; font-weight: 600; font-size: 0.85rem; padding: 6px 12px; border-radius: 4px; transition: opacity 0.2s; }
-        .btn-action:hover { opacity: 0.8; }
-        .btn-edit { background: #27272a; color: #fff; }
-        .btn-delete { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
-        .empty-state { text-align: center; color: var(--text-muted); padding: 40px 0; font-size: 0.95rem; }
-    </style>
-    <script>
-        function deslogarCms() {
-            const ajax = new XMLHttpRequest();
-            ajax.open("GET", "/admin-secreto", true, "logout_user", "logout_pass");
-            ajax.send();
-            ajax.onreadystatechange = function() {
-                if (ajax.status == 401) {
-                    alert("Você foi deslogado com segurança!");
-                    window.location.href = "/";
-                }
-            };
-        }
-    </script>
-</head>
-<body>
-    <div class="header-container">
-        <div>
-            <h1 style="font-size: 2.2rem; font-weight: 900; letter-spacing: -1px;">🚀 Micro-CMS <span style="color:var(--primary)">In-Memory</span></h1>
-            <p style="color: var(--text-muted); margin-top: 5px;">Gerenciamento de Landing Pages na velocidade máxima.</p>
-        </div>
-        <button class="btn-logout" onclick="deslogarCms()">Sair do Painel</button>
-    </div>
-
-    <div class="dashboard">
-        <div class="panel">
-            <h2>%s</h2>
-            <form method="POST" action="/admin-secreto">
-                <div>
-                    <label>Subdomínio ou Host Completo</label>
-                    <input type="text" name="slug" placeholder="ex: fellipe10.local" value="%s" required %s>
-                </div>
-                <div>
-                    <label>Código HTML/CSS da IA</label>
-                    <textarea name="html_codigo" rows="18" placeholder="Cole o código HTML completo aqui..." required style="margin-top: 5px;">%s</textarea>
-                </div>
-                <button type="submit">Salvar e Publicar na RAM</button>
-                %s
-            </form>
-        </div>
-
-        <div class="panel">
-            <h2>🌐 Subdomínios Ativos</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Endereço / Host</th>
-                        <th style="text-align: right;">Ações</th>
-                    </tr>
-                </thead>
-                <tbody>
-`, tituloForm, slugEdicao, readonlyAttr, htmlExistente, cancelBtn)
+	fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Micro-CMS</title>
+	<style>body{background:#09090b;color:#fff;font-family:system-ui;padding:40px;max-width:800px;margin:0 auto;}
+	input,textarea{width:100%%;padding:12px;margin-top:5px;background:#1c1c1e;border:1px solid #27272a;color:#fff;border-radius:6px;}
+	button{background:#00ff66;color:#000;padding:12px;border:none;border-radius:6px;font-weight:bold;cursor:pointer;margin-top:15px;width:100%%;}
+	table{width:100%%;margin-top:30px;border-collapse:collapse;}td,th{padding:12px;text-align:left;border-bottom:1px solid #27272a;}
+	.btn-del{color:#ef4444;text-decoration:none;font-size:0.9rem;}</style></head><body>
+	<h1>🚀 Micro-CMS In-Memory</h1>
+	<p style="color:#a1a1aa; margin-bottom: 20px;">Dica: Digite apenas o domínio (ex: fellipe10.fellipedev.com.br). O sistema limpa o resto automaticamente.</p>
+	<form method="POST" action="/admin-secreto">
+	<label>Host (Domínio)</label><input type="text" name="slug" value="%s" required %s>
+	<label>Código HTML Completo</label><textarea name="html_codigo" rows="15" required style="margin-top:5px;">%s</textarea>
+	<button type="submit">Salvar e Publicar na RAM</button>%s</form>
+	<h2>Páginas Ativas</h2><table>`, slugEdicao, readonlyAttr, htmlExistente, cancelBtn)
 
 	if len(listaSubdominios) == 0 {
-		fmt.Fprint(w, `<tr><td colspan="2" class="empty-state">Nenhum subdomínio configurado ainda. Use o formulário ao lado!</td></tr>`)
+		fmt.Fprint(w, `<tr><td>Nenhuma página criada.</td></tr>`)
 	} else {
 		for _, sub := range listaSubdominios {
-			fmt.Fprintf(w, `
-                    <tr>
-                        <td>%s</td>
-                        <td style="text-align: right;">
-                            <div class="actions">
-                                <a href="/admin-secreto?edit=%s" class="btn-action btn-edit">Editar</a>
-                                <a href="/admin-secreto?action=delete&slug=%s" class="btn-action btn-delete" onclick="return confirm('Tem certeza que deseja excluir %s?')">Excluir</a>
-                            </div>
-                        </td>
-                    </tr>
-                `, sub, sub, sub, sub)
+			fmt.Fprintf(w, `<tr><td>%s</td><td style="text-align:right;"><a href="/admin-secreto?edit=%s" style="color:#fff;margin-right:15px;">Editar</a><a href="/admin-secreto?action=delete&slug=%s" class="btn-del" onclick="return confirm('Excluir?')">Excluir</a></td></tr>`, sub, sub, sub)
 		}
 	}
-
-	fmt.Fprint(w, `
-                </tbody>
-            </table>
-        </div>
-    </div>
-</body>
-</html>
-`)
+	fmt.Fprint(w, `</table></body></html>`)
 }
