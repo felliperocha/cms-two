@@ -99,7 +99,7 @@ func main() {
 	})
 
 	fmt.Println("⚡ Servidor Micro-CMS rodando em http://localhost:80")
-	http.ListenAndServe(":80", nil)
+	http.ListenAndServe(":8080", nil)
 }
 
 func executarAdminSecreto(w http.ResponseWriter, r *http.Request) {
